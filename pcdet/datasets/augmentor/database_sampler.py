@@ -1,9 +1,7 @@
-import pickle
-
 import numpy as np
-
-from ...ops.iou3d_nms import iou3d_nms_utils
+import pickle
 from ...utils import box_utils
+from ...ops.iou3d_nms import iou3d_nms_utils
 
 
 class DataBaseSampler(object):

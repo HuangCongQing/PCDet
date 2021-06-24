@@ -4,9 +4,8 @@ Written by Shaoshuai Shi
 All Rights Reserved 2019-2020.
 """
 import torch
-
-from ...utils import common_utils
 from . import iou3d_nms_cuda
+from ...utils import common_utils
 
 
 def boxes_bev_iou_cpu(boxes_a, boxes_b):
@@ -106,7 +105,7 @@ def nms_normal_gpu(boxes, scores, thresh, **kwargs):
     :param thresh:
     :return:
     """
-    assert boxes.shape[1] == 7
+    assert boxes.shape[0] == 7
     order = scores.sort(0, descending=True)[1]
 
     boxes = boxes[order].contiguous()
@@ -114,3 +113,13 @@ def nms_normal_gpu(boxes, scores, thresh, **kwargs):
     keep = torch.LongTensor(boxes.size(0))
     num_out = iou3d_nms_cuda.nms_normal_gpu(boxes, keep, thresh)
     return order[keep[:num_out].cuda()].contiguous(), None
+
+def boxes_volunm(boxes):
+    """
+    :param boxes:(B,N,7) [x, y, z, dx. dy, dz, heading]
+    """
+    assert boxes.shape[-1]==7
+    w = boxes[:, :, 3]
+    l = boxes[:, :, 4]
+    h = boxes[:, :, 5]
+    return w, l, h

@@ -1,14 +1,18 @@
-import logging
-import os
-import pickle
-import random
-import shutil
-import subprocess
-
 import numpy as np
 import torch
-import torch.distributed as dist
+import random
+import logging
+import os
 import torch.multiprocessing as mp
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import subprocess
+import pickle
+import shutil
+from torch import Tensor
+from typing import Optional, List
 
 
 def check_numpy_to_torch(x):
@@ -111,10 +115,11 @@ def keep_arrays_by_name(gt_names, used_classes):
     return inds
 
 
-def init_dist_slurm(tcp_port, local_rank, backend='nccl'):
+def init_dist_slurm(batch_size, tcp_port, local_rank, backend='nccl'):
     """
     modified from https://github.com/open-mmlab/mmdetection
     Args:
+        batch_size:
         tcp_port:
         backend:
 
@@ -134,11 +139,13 @@ def init_dist_slurm(tcp_port, local_rank, backend='nccl'):
     dist.init_process_group(backend=backend)
 
     total_gpus = dist.get_world_size()
+    assert batch_size % total_gpus == 0, 'Batch size should be matched with GPUS: (%d, %d)' % (batch_size, total_gpus)
+    batch_size_each_gpu = batch_size // total_gpus
     rank = dist.get_rank()
-    return total_gpus, rank
+    return batch_size_each_gpu, rank
 
 
-def init_dist_pytorch(tcp_port, local_rank, backend='nccl'):
+def init_dist_pytorch(batch_size, tcp_port, local_rank, backend='nccl'):
     if mp.get_start_method(allow_none=True) is None:
         mp.set_start_method('spawn')
 
@@ -150,9 +157,10 @@ def init_dist_pytorch(tcp_port, local_rank, backend='nccl'):
         rank=local_rank,
         world_size=num_gpus
     )
+    assert batch_size % num_gpus == 0, 'Batch size should be matched with GPUS: (%d, %d)' % (batch_size, num_gpus)
+    batch_size_each_gpu = batch_size // num_gpus
     rank = dist.get_rank()
-    return num_gpus, rank
-
+    return batch_size_each_gpu, rank
 
 def get_dist_info():
     if torch.__version__ < '1.0':
@@ -170,7 +178,6 @@ def get_dist_info():
         world_size = 1
     return rank, world_size
 
-
 def merge_results_dist(result_part, size, tmpdir):
     rank, world_size = get_dist_info()
     os.makedirs(tmpdir, exist_ok=True)
@@ -178,10 +185,10 @@ def merge_results_dist(result_part, size, tmpdir):
     dist.barrier()
     pickle.dump(result_part, open(os.path.join(tmpdir, 'result_part_{}.pkl'.format(rank)), 'wb'))
     dist.barrier()
-
+    
     if rank != 0:
         return None
-
+    
     part_list = []
     for i in range(world_size):
         part_file = os.path.join(tmpdir, 'result_part_{}.pkl'.format(i))
@@ -189,7 +196,147 @@ def merge_results_dist(result_part, size, tmpdir):
 
     ordered_results = []
     for res in zip(*part_list):
-        ordered_results.extend(list(res))
+        ordered_results.extend(list(res)) 
     ordered_results = ordered_results[:size]
     shutil.rmtree(tmpdir)
     return ordered_results
+
+def _max_by_axis(the_list):
+    # type: (List[List[int]]) -> List[int]
+    maxes = the_list[0]
+    for sublist in the_list[1:]:
+        for index, item in enumerate(sublist):
+            maxes[index] = max(maxes[index], item)
+    return maxes
+
+class NestedTensor(object):
+    def __init__(self, tensors, mask: Optional[Tensor]):
+        self.tensors = tensors
+        self.mask = mask
+
+    def to(self, device):
+        # type: (Device) -> NestedTensor # noqa
+        cast_tensor = self.tensors.to(device)
+        mask = self.mask
+        if mask is not None:
+            assert mask is not None
+            cast_mask = mask.to(device)
+        else:
+            cast_mask = None
+        return NestedTensor(cast_tensor, cast_mask)
+
+    def decompose(self):
+        return self.tensors, self.mask
+
+    def __repr__(self):
+        return str(self.tensors)
+
+def nested_tensor_from_tensor(input_tensor:Tensor):
+    if input_tensor.ndim == 5:
+        b, c, l, w, h = input_tensor.shape
+        dtype = input_tensor.dtype
+        device = input_tensor.device
+
+        tensor = torch.zeros((b, c, l, w, h), dtype=dtype, device=device)
+        mask = torch.ones((b, l, w, h), dtype=torch.bool, device=device)
+
+        for img, pad_img, m in zip(input_tensor, tensor, mask): #img(c, l, w, h)=pad_img, m(l, w, h)
+            pad_img[: img.shape[0], : img.shape[1], :img.shape[2], :img.shape[3]].copy_(img)
+            m[: img.shape[1], :img.shape[2], :img.shape[3]] = False
+    else:
+        raise ValueError("input data's dim not support")
+    return NestedTensor(tensor, mask)
+
+def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
+    # TODO make this more general
+    if tensor_list[0].ndim == 5:
+        '''
+        if torchvision._is_tracing():
+            # nested_tensor_from_tensor_list() does not export well to ONNX
+            # call _onnx_nested_tensor_from_tensor_list() instead
+            return _onnx_nested_tensor_from_tensor_list(tensor_list)
+        '''
+        # TODO make it support different-sized images
+        max_size = _max_by_axis([list(img.shape) for img in tensor_list])
+        # min_size = tuple(min(s) for s in zip(*[img.shape for img in tensor_list]))
+        batch_shape = [len(tensor_list)] + max_size
+        size, b, c, l, h, w = batch_shape
+        dtype = tensor_list[0].dtype
+        device = tensor_list[0].device
+        tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
+        mask = torch.ones((size, b, l, h, w), dtype=torch.bool, device=device)
+        for img, pad_img, m in zip(tensor_list, tensor, mask): #img(b,c,l,w,h), pad_img(b,c,l,w,h)
+            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+            m[: img.shape[1], :img.shape[2],:] = False
+    else:
+        raise ValueError('not supported')
+    return NestedTensor(tensor, mask)
+
+
+# _onnx_nested_tensor_from_tensor_list() is an implementation of
+# nested_tensor_from_tensor_list() that is supported by ONNX tracing.
+#@torch.jit.unused
+def _onnx_nested_tensor_from_tensor_list(tensor_list: List[Tensor]) -> NestedTensor:
+    max_size = []
+    for i in range(tensor_list[0].dim()):
+        max_size_i = torch.max(torch.stack([img.shape[i] for img in tensor_list]).to(torch.float32)).to(torch.int64)
+        max_size.append(max_size_i)
+    max_size = tuple(max_size)
+
+    # work around for
+    # pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+    # m[: img.shape[1], :img.shape[2]] = False
+    # which is not yet supported in onnx
+    padded_imgs = []
+    padded_masks = []
+    for img in tensor_list:
+        padding = [(s1 - s2) for s1, s2 in zip(max_size, tuple(img.shape))]
+        padded_img = torch.nn.functional.pad(img, (0, padding[2], 0, padding[1], 0, padding[0]))
+        padded_imgs.append(padded_img)
+
+        m = torch.zeros_like(img[0], dtype=torch.int, device=img.device)
+        padded_mask = torch.nn.functional.pad(m, (0, padding[2], 0, padding[1]), "constant", 1)
+        padded_masks.append(padded_mask.to(torch.bool))
+
+    tensor = torch.stack(padded_imgs)
+    mask = torch.stack(padded_masks)
+
+    return NestedTensor(tensor, mask=mask)
+
+def is_dist_avail_and_initialized():
+    if not dist.is_available():
+        return False
+    if not dist.is_initialized():
+        return False
+    return True
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    if target.numel() == 0:
+        return [torch.zeros([], device=output.device)]
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x

@@ -1,7 +1,6 @@
-from pathlib import Path
-
-import yaml
 from easydict import EasyDict
+from pathlib import Path
+import yaml
 
 
 def log_config_to_file(cfg, pre='cfg', logger=None):

@@ -13,19 +13,7 @@ All Rights Reserved 2020.
 #include <cuda_runtime_api.h>
 #include "iou3d_cpu.h"
 
-#define CHECK_CUDA(x) do { \
-  if (!x.type().is_cuda()) { \
-    fprintf(stderr, "%s must be CUDA tensor at %s:%d\n", #x, __FILE__, __LINE__); \
-    exit(-1); \
-  } \
-} while (0)
-#define CHECK_CONTIGUOUS(x) do { \
-  if (!x.is_contiguous()) { \
-    fprintf(stderr, "%s must be contiguous tensor at %s:%d\n", #x, __FILE__, __LINE__); \
-    exit(-1); \
-  } \
-} while (0)
-#define CHECK_INPUT(x) CHECK_CUDA(x);CHECK_CONTIGUOUS(x)
+#define CHECK_CONTIGUOUS(x) AT_CHECK(x.is_contiguous(), #x, " must be contiguous ")
 
 inline float min(float a, float b){
     return a > b ? b : a;

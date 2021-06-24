@@ -1,6 +1,7 @@
 import torch
+from torch.autograd import Variable
+from torch.autograd import Function
 import torch.nn as nn
-from torch.autograd import Function, Variable
 
 from . import pointnet2_stack_cuda as pointnet2
 
@@ -33,7 +34,7 @@ class BallQuery(Function):
         idx = torch.cuda.IntTensor(M, nsample).zero_()
 
         pointnet2.ball_query_wrapper(B, M, radius, nsample, new_xyz, new_xyz_batch_cnt, xyz, xyz_batch_cnt, idx)
-        empty_ball_mask = (idx[:, 0] == -1)
+        empty_ball_mask = (idx[:, 0] == -1) #记录空的ball，无neighbors
         idx[empty_ball_mask] = 0
         return idx, empty_ball_mask
 
@@ -53,7 +54,7 @@ class GroupingOperation(Function):
         """
         Args:
             ctx:
-            features: (N1 + N2 ..., C) tensor of features to group
+            features: (N1 + N2 ..., C) tensor of features to group，N1，N2等是每个batch的样本数
             features_batch_cnt: (batch_size) [N1 + N2 ...] tensor containing the indicies of features to group with
             idx: (M1 + M2 ..., nsample) tensor containing the indicies of features to group with
             idx_batch_cnt: (batch_size) [M1 + M2 ...] tensor containing the indicies of features to group with
@@ -180,86 +181,32 @@ class FurthestPointSampling(Function):
     def backward(xyz, a=None):
         return None, None
 
-
-furthest_point_sample = FurthestPointSampling.apply
-
-
-class ThreeNN(Function):
+class FurthestPointSamplingSpconv(Function):
     @staticmethod
-    def forward(ctx, unknown, unknown_batch_cnt, known, known_batch_cnt):
+    def forward(ctx, xyz: torch.Tensor, npoint: int):
         """
         Args:
             ctx:
-            unknown: (N1 + N2..., 3)
-            unknown_batch_cnt: (batch_size), [N1, N2, ...]
-            known: (M1 + M2..., 3)
-            known_batch_cnt: (batch_size), [M1, M2, ...]
+            xyz: (B, N, 3) where N > npoint
+            npoint: int, number of features in the sampled set
 
         Returns:
-            dist: (N1 + N2 ..., 3)  l2 distance to the three nearest neighbors
-            idx: (N1 + N2 ..., 3)  index of the three nearest neighbors, range [0, M1+M2+...]
+            output: (B, npoint) tensor containing the set
         """
-        assert unknown.shape.__len__() == 2 and unknown.shape[1] == 3
-        assert known.shape.__len__() == 2 and known.shape[1] == 3
-        assert unknown_batch_cnt.__len__() == known_batch_cnt.__len__()
+        assert xyz.is_contiguous()
 
-        dist2 = unknown.new_zeros(unknown.shape)
-        idx = unknown_batch_cnt.new_zeros(unknown.shape).int()
+        N, _ = xyz.size()
+        output = torch.cuda.IntTensor(1, npoint)
+        temp = torch.cuda.FloatTensor(1, N).fill_(1e10)
 
-        pointnet2.three_nn_wrapper(
-            unknown.contiguous(), unknown_batch_cnt.contiguous(),
-            known.contiguous(), known_batch_cnt.contiguous(), dist2, idx
-        )
-        return torch.sqrt(dist2), idx
-
-    @staticmethod
-    def backward(ctx, a=None, b=None):
-        return None, None
-
-
-three_nn = ThreeNN.apply
-
-
-class ThreeInterpolate(Function):
-
-    @staticmethod
-    def forward(ctx, features: torch.Tensor, idx: torch.Tensor, weight: torch.Tensor):
-        """
-        Args:
-            ctx:
-            features: (M1 + M2 ..., C)
-            idx: [N1 + N2 ..., 3]
-            weight: [N1 + N2 ..., 3]
-
-        Returns:
-            out_tensor: (N1 + N2 ..., C)
-        """
-        assert idx.shape[0] == weight.shape[0] and idx.shape[1] == weight.shape[1] == 3
-
-        ctx.three_interpolate_for_backward = (idx, weight, features.shape[0])
-        output = features.new_zeros((idx.shape[0], features.shape[1]))
-        pointnet2.three_interpolate_wrapper(features.contiguous(), idx.contiguous(), weight.contiguous(), output)
+        pointnet2.furthest_point_sampling_wrapper(1, N, npoint, xyz, temp, output)
         return output
 
     @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        """
-        Args:
-            ctx:
-            grad_out: (N1 + N2 ..., C)
+    def backward(xyz, a=None):
+        return None, None
 
-        Returns:
-            grad_features: (M1 + M2 ..., C)
-        """
-        idx, weight, M = ctx.three_interpolate_for_backward
-        grad_features = grad_out.new_zeros((M, grad_out.shape[1]))
-        pointnet2.three_interpolate_grad_wrapper(
-            grad_out.contiguous(), idx.contiguous(), weight.contiguous(), grad_features
-        )
-        return grad_features, None, None
-
-
-three_interpolate = ThreeInterpolate.apply
+furthest_point_sample = FurthestPointSampling.apply
 
 
 if __name__ == '__main__':

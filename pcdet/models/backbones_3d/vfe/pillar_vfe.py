@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from .vfe_template import VFETemplate
-
 
 class PFNLayer(nn.Module):
     def __init__(self,
@@ -24,20 +22,10 @@ class PFNLayer(nn.Module):
         else:
             self.linear = nn.Linear(in_channels, out_channels, bias=True)
 
-        self.part = 50000
-
     def forward(self, inputs):
-        if inputs.shape[0] > self.part:
-            # nn.Linear performs randomly when batch size is too large
-            num_parts = inputs.shape[0] // self.part
-            part_linear_out = [self.linear(inputs[num_part*self.part:(num_part+1)*self.part])
-                               for num_part in range(num_parts+1)]
-            x = torch.cat(part_linear_out, dim=0)
-        else:
-            x = self.linear(inputs)
-        torch.backends.cudnn.enabled = False
-        x = self.norm(x.permute(0, 2, 1)).permute(0, 2, 1) if self.use_norm else x
-        torch.backends.cudnn.enabled = True
+        x = self.linear(inputs)
+        total_points, voxel_points, channels = x.shape
+        x = self.norm(x.view(-1, channels)).view(total_points, voxel_points, channels) if self.use_norm else x
         x = F.relu(x)
         x_max = torch.max(x, dim=1, keepdim=True)[0]
 
@@ -47,7 +35,6 @@ class PFNLayer(nn.Module):
             x_repeat = x_max.repeat(1, inputs.shape[1], 1)
             x_concatenated = torch.cat([x, x_repeat], dim=2)
             return x_concatenated
-
 
 class PillarVFE(VFETemplate):
     def __init__(self, model_cfg, num_point_features, voxel_size, point_cloud_range):
@@ -120,19 +107,4 @@ class PillarVFE(VFETemplate):
             features = pfn(features)
         features = features.squeeze()
         batch_dict['pillar_features'] = features
-        print('batch_dict-------------------','\n',batch_dict)
         return batch_dict
-''' 
-一个 batch_dict：
-'batch_size'：        3  # 3帧点云
-'points'              torch.Size([69375, 5])  # 点数目可变 猜测(? x y z r)
-'frame_id'            (3,)  # 帧编号
-'gt_boxes'            torch.Size([3, 40, 8])  # 3帧点，好像每帧最多40个ground truth，[x, y, z, 长dx, 宽dy, 高dz, 角度heading, 标签？]
-'use_lead_xyz'        torch.Size([3])  # ？
-'voxels'              torch.Size([17842, 32, 4]) # 体素
-'voxel_coords'        torch.Size([17842, 4]) # 体素坐标
-'voxel_num_points'    torch.Size([17842])  # 体素点数
-'image_shape'         (3, 2) # 图像尺寸
-'pillar_features'     torch.Size([17842, 64])  # pillar特征（C, P）的Tensor，特征维度C=64，Pillar非空P=17842个
-
- '''

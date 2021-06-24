@@ -1,12 +1,10 @@
-import copy
 import pickle
-
+import copy
 import numpy as np
 from skimage import io
-
-from ...ops.roiaware_pool3d import roiaware_pool3d_utils
-from ...utils import box_utils, calibration_kitti, common_utils, object3d_kitti
+from ...utils import box_utils, common_utils, calibration_kitti, object3d_kitti
 from ..dataset import DatasetTemplate
+from ...ops.roiaware_pool3d import roiaware_pool3d_utils
 
 
 class KittiDataset(DatasetTemplate):
@@ -66,7 +64,7 @@ class KittiDataset(DatasetTemplate):
 
     def get_image_shape(self, idx):
         img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
-        assert img_file.exists()
+        assert img_file.exists(),'{} missing'.format(idx)
         return np.array(io.imread(img_file).shape[:2], dtype=np.int32)
 
     def get_label(self, idx):
@@ -282,7 +280,7 @@ class KittiDataset(DatasetTemplate):
             pred_boxes_img = box_utils.boxes3d_kitti_camera_to_imageboxes(
                 pred_boxes_camera, calib, image_shape=image_shape
             )
-
+            class_names.append('None') #modified by Zhao Gong for adopting TrPD
             pred_dict['name'] = np.array(class_names)[pred_labels - 1]
             pred_dict['alpha'] = -np.arctan2(-pred_boxes[:, 1], pred_boxes[:, 0]) + pred_boxes_camera[:, 6]
             pred_dict['bbox'] = pred_boxes_img
@@ -332,16 +330,10 @@ class KittiDataset(DatasetTemplate):
         return ap_result_str, ap_dict
 
     def __len__(self):
-        if self._merge_all_iters_to_one_epoch:
-            return len(self.kitti_infos) * self.total_epochs
-
         return len(self.kitti_infos)
 
     def __getitem__(self, index):
         # index = 4
-        if self._merge_all_iters_to_one_epoch:
-            index = index % len(self.kitti_infos)
-
         info = copy.deepcopy(self.kitti_infos[index])
 
         sample_idx = info['point_cloud']['lidar_idx']
@@ -437,3 +429,4 @@ if __name__ == '__main__':
             data_path=ROOT_DIR / 'data' / 'kitti',
             save_path=ROOT_DIR / 'data' / 'kitti'
         )
+

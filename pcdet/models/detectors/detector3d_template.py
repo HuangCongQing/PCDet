@@ -1,13 +1,11 @@
-import os
-
 import torch
+import os
 import torch.nn as nn
-
-from ...ops.iou3d_nms import iou3d_nms_utils # nms
-from .. import backbones_2d, backbones_3d, dense_heads, roi_heads # import
+from .. import backbones_3d, backbones_2d, dense_heads, roi_heads, transformer, transformer_heads,postion_embeding
+from ..backbones_3d import vfe, pfe
 from ..backbones_2d import map_to_bev
-from ..backbones_3d import pfe, vfe
-from ..model_utils import model_nms_utils # nms??
+from ..model_utils.model_nms_utils import class_agnostic_nms
+from ...ops.iou3d_nms import iou3d_nms_utils
 
 
 class Detector3DTemplate(nn.Module):
@@ -19,9 +17,18 @@ class Detector3DTemplate(nn.Module):
         self.class_names = dataset.class_names
         self.register_buffer('global_step', torch.LongTensor(1).zero_())
 
-        self.module_topology = [ # 储存了网络中的每一个模块,vfe表示voxel_feature，pfe表示point_feature
-            'vfe', 'backbone_3d', 'map_to_bev_module', 'pfe',
-            'backbone_2d', 'dense_head',  'point_head', 'roi_head'
+        self.module_topology = [
+            'vfe', 'backbone_3d',
+            'map_to_bev_module',
+            'pfe',
+            'backbone_2d',
+            'dense_head',
+            'point_head',
+            'roi_head',
+            'voxel_encoder',
+            'transformer',
+            'transformer_head',
+            #'criterion'
         ]
 
     @property
@@ -32,20 +39,69 @@ class Detector3DTemplate(nn.Module):
         self.global_step += 1
 
     def build_networks(self):
-        model_info_dict = {#参数
-            'module_list': [],  #使用的模型
-            'num_rawpoint_features': self.dataset.point_feature_encoder.num_point_features, #点云特征
-            'num_point_features': self.dataset.point_feature_encoder.num_point_features,
-            'grid_size': self.dataset.grid_size, #网格大小
-            'point_cloud_range': self.dataset.point_cloud_range, #点云范围
-            'voxel_size': self.dataset.voxel_size #体素大小
+        model_info_dict = {
+            'module_list': [],
+            'num_rawpoint_features': self.dataset.point_feature_encoder.num_point_features,
+            'grid_size': self.dataset.grid_size,
+            'point_cloud_range': self.dataset.point_cloud_range,
+            'voxel_size': self.dataset.voxel_size
         }
-        for module_name in self.module_topology: #   module_topology储存了网络中的每一个module
+        for module_name in self.module_topology:
             module, model_info_dict = getattr(self, 'build_%s' % module_name)(
                 model_info_dict=model_info_dict
-            ) # getattr() 函数用于返回一个对象属性值，将build_module_name返回给了module
-            self.add_module(module_name, module) #添加一个模块
+            )
+            self.add_module(module_name, module)
         return model_info_dict['module_list']
+
+    def build_voxel_encoder(self, model_info_dict):
+        if self.model_cfg.get('VOXELENCODER', None) is None:
+            return None, model_info_dict
+        voxel_encoder = postion_embeding.__all__[self.model_cfg.VOXELENCODER.NAME](
+            model_cfg=self.model_cfg.VOXELENCODER
+        )
+
+        model_info_dict['module_list'].append(voxel_encoder)
+        model_info_dict['num_voxel_encoder_features'] = voxel_encoder.num_output_feature
+        return voxel_encoder, model_info_dict
+
+    def build_transformer(self,model_info_dict):
+        if self.model_cfg.get('TRANSFORMER', None) is None:
+            return None, model_info_dict
+
+        transformer_module = transformer.__all__[self.model_cfg.TRANSFORMER.NAME](
+            model_cfg=self.model_cfg.TRANSFORMER,
+            #num_class=len(self.model_cfg.CLASS_NAMES)
+        )
+        model_info_dict['module_list'].append(transformer_module)
+        model_info_dict['num_transformer_features'] = transformer_module.dim_feedforward
+        return transformer_module, model_info_dict
+
+    def build_transformer_head(self, model_info_dict):
+        if self.model_cfg.get('TRANSFORMER_HEAD', None) is None:
+            return None, model_info_dict
+
+        transformer_head = transformer_heads.__all__[self.model_cfg.TRANSFORMER_HEAD.NAME](
+            model_cfg=self.model_cfg.TRANSFORMER_HEAD,
+            num_class=len(self.model_cfg.CLASS_NAMES)+1
+        )
+        model_info_dict['module_list'].append(transformer_head)
+        model_info_dict['num_boxes_features'] = transformer_head.bbox_dim
+        model_info_dict['num_cls_features'] = transformer_head.cls_dim
+        return transformer_head, model_info_dict
+
+    def build_criterion(self, model_info_dict):
+        if self.model_cfg.get('CRITERION', None) is None:
+            return None, model_info_dict
+
+        criterion = transformer_heads.__all__[self.model_cfg.CRITERION.NAME](
+            num_classes=len(self.model_cfg.CLASS_NAMES),
+            weight_dict=self.model_cfg.CRITERION.WEIGHT_DICT,
+            eos_coef=self.model_cfg.CRITERION.NO_OBJECT_WEIGHT,
+            losses=self.model_cfg.CRITERION.LOSS
+        )
+        model_info_dict['module_list'].append(criterion)
+        model_info_dict['output losses'] = 'output losses'
+        return criterion, model_info_dict
 
     def build_vfe(self, model_info_dict):
         if self.model_cfg.get('VFE', None) is None:
@@ -89,7 +145,7 @@ class Detector3DTemplate(nn.Module):
         return map_to_bev_module, model_info_dict
 
     def build_backbone_2d(self, model_info_dict):
-        if self.model_cfg.get('BACKBONE_2D', None) is None:
+        if self.model_cfg.get('BACKBONE_2D', None) is None: 
             return None, model_info_dict
 
         backbone_2d_module = backbones_2d.__all__[self.model_cfg.BACKBONE_2D.NAME](
@@ -144,7 +200,6 @@ class Detector3DTemplate(nn.Module):
             model_cfg=self.model_cfg.POINT_HEAD,
             input_channels=num_point_features,
             num_class=self.num_class if not self.model_cfg.POINT_HEAD.CLASS_AGNOSTIC else 1,
-            predict_boxes_when_training=self.model_cfg.get('ROI_HEAD', False)
         )
 
         model_info_dict['module_list'].append(point_head_module)
@@ -156,7 +211,7 @@ class Detector3DTemplate(nn.Module):
         point_head_module = roi_heads.__all__[self.model_cfg.ROI_HEAD.NAME](
             model_cfg=self.model_cfg.ROI_HEAD,
             input_channels=model_info_dict['num_point_features'],
-            num_class=self.num_class if not self.model_cfg.ROI_HEAD.CLASS_AGNOSTIC else 1,
+            num_class=self.num_class if not self.model_cfg.POINT_HEAD.CLASS_AGNOSTIC else 1,
         )
 
         model_info_dict['module_list'].append(point_head_module)
@@ -171,14 +226,10 @@ class Detector3DTemplate(nn.Module):
             batch_dict:
                 batch_size:
                 batch_cls_preds: (B, num_boxes, num_classes | 1) or (N1+N2+..., num_classes | 1)
-                                or [(B, num_boxes, num_class1), (B, num_boxes, num_class2) ...]
-                multihead_label_mapping: [(num_class1), (num_class2), ...]
                 batch_box_preds: (B, num_boxes, 7+C) or (N1+N2+..., 7+C)
                 cls_preds_normalized: indicate whether batch_cls_preds is normalized
                 batch_index: optional (N1+N2+...)
-                has_class_labels: True/False
                 roi_labels: (B, num_rois)  1 .. num_classes
-                batch_pred_labels: (B, num_boxes, 1)
         Returns:
 
         """
@@ -188,63 +239,29 @@ class Detector3DTemplate(nn.Module):
         pred_dicts = []
         for index in range(batch_size):
             if batch_dict.get('batch_index', None) is not None:
-                assert batch_dict['batch_box_preds'].shape.__len__() == 2
+                assert batch_dict['batch_cls_preds'].shape.__len__() == 2
                 batch_mask = (batch_dict['batch_index'] == index)
             else:
-                assert batch_dict['batch_box_preds'].shape.__len__() == 3
+                assert batch_dict['batch_cls_preds'].shape.__len__() == 3
                 batch_mask = index
 
             box_preds = batch_dict['batch_box_preds'][batch_mask]
+            cls_preds = batch_dict['batch_cls_preds'][batch_mask]
+
+            src_cls_preds = cls_preds
             src_box_preds = box_preds
+            assert cls_preds.shape[1] in [1, self.num_class+1]
 
-            if not isinstance(batch_dict['batch_cls_preds'], list):
-                cls_preds = batch_dict['batch_cls_preds'][batch_mask]
-
-                src_cls_preds = cls_preds
-                assert cls_preds.shape[1] in [1, self.num_class]
-
-                if not batch_dict['cls_preds_normalized']:
-                    cls_preds = torch.sigmoid(cls_preds)
-            else:
-                cls_preds = [x[batch_mask] for x in batch_dict['batch_cls_preds']]
-                src_cls_preds = cls_preds
-                if not batch_dict['cls_preds_normalized']:
-                    cls_preds = [torch.sigmoid(x) for x in cls_preds]
+            if not batch_dict['cls_preds_normalized']:
+                cls_preds = torch.sigmoid(cls_preds)
 
             if post_process_cfg.NMS_CONFIG.MULTI_CLASSES_NMS:
-                if not isinstance(cls_preds, list):
-                    cls_preds = [cls_preds]
-                    multihead_label_mapping = [torch.arange(1, self.num_class, device=cls_preds[0].device)]
-                else:
-                    multihead_label_mapping = batch_dict['multihead_label_mapping']
-
-                cur_start_idx = 0
-                pred_scores, pred_labels, pred_boxes = [], [], []
-                for cur_cls_preds, cur_label_mapping in zip(cls_preds, multihead_label_mapping):
-                    assert cur_cls_preds.shape[1] == len(cur_label_mapping)
-                    cur_box_preds = box_preds[cur_start_idx: cur_start_idx + cur_cls_preds.shape[0]]
-                    cur_pred_scores, cur_pred_labels, cur_pred_boxes = model_nms_utils.multi_classes_nms(
-                        cls_scores=cur_cls_preds, box_preds=cur_box_preds,
-                        nms_config=post_process_cfg.NMS_CONFIG,
-                        score_thresh=post_process_cfg.SCORE_THRESH
-                    )
-                    cur_pred_labels = cur_label_mapping[cur_pred_labels]
-                    pred_scores.append(cur_pred_scores)
-                    pred_labels.append(cur_pred_labels)
-                    pred_boxes.append(cur_pred_boxes)
-                    cur_start_idx += cur_cls_preds.shape[0]
-
-                final_scores = torch.cat(pred_scores, dim=0)
-                final_labels = torch.cat(pred_labels, dim=0)
-                final_boxes = torch.cat(pred_boxes, dim=0)
+                raise NotImplementedError
             else:
                 cls_preds, label_preds = torch.max(cls_preds, dim=-1)
-                if batch_dict.get('has_class_labels', False):
-                    label_key = 'roi_labels' if 'roi_labels' in batch_dict else 'batch_pred_labels'
-                    label_preds = batch_dict[label_key][index]
-                else:
-                    label_preds = label_preds + 1
-                selected, selected_scores = model_nms_utils.class_agnostic_nms(
+                label_preds = batch_dict['roi_labels'][index] if batch_dict.get('has_class_labels', False) else label_preds + 1
+
+                selected, selected_scores = class_agnostic_nms(
                     box_scores=cls_preds, box_preds=box_preds,
                     nms_config=post_process_cfg.NMS_CONFIG,
                     score_thresh=post_process_cfg.SCORE_THRESH
@@ -293,14 +310,14 @@ class Detector3DTemplate(nn.Module):
             k -= 1
         cur_gt = cur_gt[:k + 1]
 
-        if cur_gt.shape[0] > 0:
+        if cur_gt.sum() > 0:
             if box_preds.shape[0] > 0:
-                iou3d_rcnn = iou3d_nms_utils.boxes_iou3d_gpu(box_preds[:, 0:7], cur_gt[:, 0:7])
+                iou3d_rcnn = iou3d_nms_utils.boxes_iou3d_gpu(box_preds, cur_gt[:, 0:7])
             else:
                 iou3d_rcnn = torch.zeros((0, cur_gt.shape[0]))
 
             if rois is not None:
-                iou3d_roi = iou3d_nms_utils.boxes_iou3d_gpu(rois[:, 0:7], cur_gt[:, 0:7])
+                iou3d_roi = iou3d_nms_utils.boxes_iou3d_gpu(rois, cur_gt[:, 0:7])
 
             for cur_thresh in thresh_list:
                 if iou3d_rcnn.shape[0] == 0:
@@ -316,12 +333,12 @@ class Detector3DTemplate(nn.Module):
         else:
             gt_iou = box_preds.new_zeros(box_preds.shape[0])
         return recall_dict
-    # 加载权重文件
+
     def load_params_from_file(self, filename, logger, to_cpu=False):
         if not os.path.isfile(filename):
             raise FileNotFoundError
 
-        logger.info('==> 【detector3d_template.py】Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
+        logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
         loc_type = torch.device('cpu') if to_cpu else None
         checkpoint = torch.load(filename, map_location=loc_type)
         model_state_disk = checkpoint['model_state']
@@ -342,14 +359,14 @@ class Detector3DTemplate(nn.Module):
         for key in state_dict:
             if key not in update_model_state:
                 logger.info('Not updated weight %s: %s' % (key, str(state_dict[key].shape)))
-        # ==> Done (loaded 367/367)
-        logger.info('==>【detector3d_template.py】 Done (loaded %d/%d)' % (len(update_model_state), len(self.state_dict())))
+
+        logger.info('==> Done (loaded %d/%d)' % (len(update_model_state), len(self.state_dict())))
 
     def load_params_with_optimizer(self, filename, to_cpu=False, optimizer=None, logger=None):
         if not os.path.isfile(filename):
             raise FileNotFoundError
-        
-        logger.info('==> 【detector3d_template.py】Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
+
+        logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
         loc_type = torch.device('cpu') if to_cpu else None
         checkpoint = torch.load(filename, map_location=loc_type)
         epoch = checkpoint.get('epoch', -1)

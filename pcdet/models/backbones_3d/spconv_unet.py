@@ -1,11 +1,9 @@
-from functools import partial
-
-import spconv
 import torch
 import torch.nn as nn
-
-from ...utils import common_utils
+import spconv
+from functools import partial
 from .spconv_backbone import post_act_block
+from ...utils import common_utils
 
 
 class SparseBasicBlock(spconv.SparseModule):
@@ -93,18 +91,16 @@ class UNetV2(nn.Module):
             block(64, 64, 3, norm_fn=norm_fn, padding=1, indice_key='subm4'),
         )
 
-        if self.model_cfg.get('RETURN_ENCODED_TENSOR', True):
-            last_pad = self.model_cfg.get('last_pad', 0)
+        last_pad = 0
+        last_pad = self.model_cfg.get('last_pad', last_pad)
 
-            self.conv_out = spconv.SparseSequential(
-                # [200, 150, 5] -> [200, 150, 2]
-                spconv.SparseConv3d(64, 128, (3, 1, 1), stride=(2, 1, 1), padding=last_pad,
-                                    bias=False, indice_key='spconv_down2'),
-                norm_fn(128),
-                nn.ReLU(),
-            )
-        else:
-            self.conv_out = None
+        self.conv_out = spconv.SparseSequential(
+            # [200, 150, 5] -> [200, 150, 2]
+            spconv.SparseConv3d(64, 128, (3, 1, 1), stride=(2, 1, 1), padding=last_pad,
+                                bias=False, indice_key='spconv_down2'),
+            norm_fn(128),
+            nn.ReLU(),
+        )
 
         # decoder
         # [400, 352, 11] <- [200, 176, 5]
@@ -179,18 +175,15 @@ class UNetV2(nn.Module):
             batch_size=batch_size
         )
         x = self.conv_input(input_sp_tensor)
-
+        
         x_conv1 = self.conv1(x)
         x_conv2 = self.conv2(x_conv1)
         x_conv3 = self.conv3(x_conv2)
         x_conv4 = self.conv4(x_conv3)
 
-        if self.conv_out is not None:
-            # for detection head
-            # [200, 176, 5] -> [200, 176, 2]
-            out = self.conv_out(x_conv4)
-            batch_dict['encoded_spconv_tensor'] = out
-            batch_dict['encoded_spconv_tensor_stride'] = 8
+        # for detection head
+        # [200, 176, 5] -> [200, 176, 2]
+        out = self.conv_out(x_conv4)
 
         # for segmentation head
         # [400, 352, 11] <- [200, 176, 5]
@@ -208,4 +201,6 @@ class UNetV2(nn.Module):
             point_cloud_range=self.point_cloud_range
         )
         batch_dict['point_coords'] = torch.cat((x_up1.indices[:, 0:1].float(), point_coords), dim=1)
+        batch_dict['encoded_spconv_tensor'] = out
+        batch_dict['encoded_spconv_tensor_stride'] = 8
         return batch_dict

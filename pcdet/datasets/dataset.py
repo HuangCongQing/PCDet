@@ -1,13 +1,11 @@
-from collections import defaultdict
 from pathlib import Path
-
+from collections import defaultdict
 import numpy as np
 import torch.utils.data as torch_data
-
-from ..utils import common_utils
 from .augmentor.data_augmentor import DataAugmentor
 from .processor.data_processor import DataProcessor
 from .processor.point_feature_encoder import PointFeatureEncoder
+from ..utils import common_utils
 
 
 class DatasetTemplate(torch_data.Dataset):
@@ -36,8 +34,6 @@ class DatasetTemplate(torch_data.Dataset):
 
         self.grid_size = self.data_processor.grid_size
         self.voxel_size = self.data_processor.voxel_size
-        self.total_epochs = 0
-        self._merge_all_iters_to_one_epoch = False
 
     @property
     def mode(self):
@@ -68,13 +64,6 @@ class DatasetTemplate(torch_data.Dataset):
         Returns:
 
         """
-
-    def merge_all_iters_to_one_epoch(self, merge=True, epochs=None):
-        if merge:
-            self._merge_all_iters_to_one_epoch = True
-            self.total_epochs = epochs
-        else:
-            self._merge_all_iters_to_one_epoch = False
 
     def __len__(self):
         raise NotImplementedError
@@ -124,6 +113,9 @@ class DatasetTemplate(torch_data.Dataset):
                     'gt_boxes_mask': gt_boxes_mask
                 }
             )
+            if len(data_dict['gt_boxes']) == 0:
+                new_index = np.random.randint(self.__len__())
+                return self.__getitem__(new_index)
 
         if data_dict.get('gt_boxes', None) is not None:
             selected = common_utils.keep_arrays_by_name(data_dict['gt_names'], self.class_names)
@@ -138,11 +130,6 @@ class DatasetTemplate(torch_data.Dataset):
         data_dict = self.data_processor.forward(
             data_dict=data_dict
         )
-
-        if self.training and len(data_dict['gt_boxes']) == 0:
-            new_index = np.random.randint(self.__len__())
-            return self.__getitem__(new_index)
-
         data_dict.pop('gt_names', None)
 
         return data_dict
@@ -158,29 +145,22 @@ class DatasetTemplate(torch_data.Dataset):
 
         for key, val in data_dict.items():
             try:
-                if key in ['voxels', 'voxel_num_points']: # 对应体素
-                    ret[key] = np.concatenate(val, axis=0) # 多个数组的拼接
-                elif key in ['points', 'voxel_coords']: # #对应关键点
+                if key in ['voxels', 'voxel_num_points']:
+                    ret[key] = np.concatenate(val, axis=0)
+                elif key in ['points', 'voxel_coords']:
                     coors = []
                     for i, coor in enumerate(val):
                         coor_pad = np.pad(coor, ((0, 0), (1, 0)), mode='constant', constant_values=i)
-                        """
-                            ((0,0),(1,0))
-                            在二维数组array第一维（此处便是行）前面填充0行，最后面填充0行；
-                            在二维数组array第二维（此处便是列）前面填充1列，最后面填充0列
-                            mode='constant'表示指定填充的参数
-                            constant_values=i 表示第一维填充i
-                        """
-                        coors.append(coor_pad) #将coor_pad补充在coors后面
+                        coors.append(coor_pad)
                     ret[key] = np.concatenate(coors, axis=0)
-                elif key in ['gt_boxes']: # 对应真值
-                    max_gt = max([len(x) for x in val]) # 找寻最大价值的点
-                    batch_gt_boxes3d = np.zeros((batch_size, max_gt, val[0].shape[-1]), dtype=np.float32) # #画可视图用的
+                elif key in ['gt_boxes']:
+                    max_gt = max([len(x) for x in val])
+                    batch_gt_boxes3d = np.zeros((batch_size, max_gt, val[0].shape[-1]), dtype=np.float32)
                     for k in range(batch_size):
                         batch_gt_boxes3d[k, :val[k].__len__(), :] = val[k]
                     ret[key] = batch_gt_boxes3d
                 else:
-                    ret[key] = np.stack(val, axis=0) # #类似concatenate,给指定axis增加维度
+                    ret[key] = np.stack(val, axis=0)
             except:
                 print('Error in collate_batch: key=%s' % key)
                 raise TypeError

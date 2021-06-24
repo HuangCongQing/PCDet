@@ -2,10 +2,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from ...utils import box_coder_utils, common_utils, loss_utils
-from ..model_utils.model_nms_utils import class_agnostic_nms
 from .target_assigner.proposal_target_layer import ProposalTargetLayer
+from ..model_utils.model_nms_utils import class_agnostic_nms
+from ...utils import common_utils, loss_utils, box_coder_utils
 
 
 class RoIHeadTemplate(nn.Module):
@@ -13,9 +12,7 @@ class RoIHeadTemplate(nn.Module):
         super().__init__()
         self.model_cfg = model_cfg
         self.num_class = num_class
-        self.box_coder = getattr(box_coder_utils, self.model_cfg.TARGET_CONFIG.BOX_CODER)(
-            **self.model_cfg.TARGET_CONFIG.get('BOX_CODER_CONFIG', {})
-        )
+        self.box_coder = getattr(box_coder_utils, self.model_cfg.TARGET_CONFIG.BOX_CODER)()
         self.proposal_target_layer = ProposalTargetLayer(roi_sampler_cfg=self.model_cfg.TARGET_CONFIG)
         self.build_losses(self.model_cfg.LOSS_CONFIG)
         self.forward_ret_dict = None
@@ -42,7 +39,6 @@ class RoIHeadTemplate(nn.Module):
         fc_layers = nn.Sequential(*fc_layers)
         return fc_layers
 
-    @torch.no_grad()
     def proposal_layer(self, batch_dict, nms_config):
         """
         Args:
@@ -64,7 +60,7 @@ class RoIHeadTemplate(nn.Module):
         batch_size = batch_dict['batch_size']
         batch_box_preds = batch_dict['batch_box_preds']
         batch_cls_preds = batch_dict['batch_cls_preds']
-        rois = batch_box_preds.new_zeros((batch_size, nms_config.NMS_POST_MAXSIZE, batch_box_preds.shape[-1]))
+        rois = batch_box_preds.new_zeros((batch_size, nms_config.NMS_POST_MAXSIZE, batch_box_preds.shape[-1])) # (B, N, 7+C)
         roi_scores = batch_box_preds.new_zeros((batch_size, nms_config.NMS_POST_MAXSIZE))
         roi_labels = batch_box_preds.new_zeros((batch_size, nms_config.NMS_POST_MAXSIZE), dtype=torch.long)
 
@@ -95,7 +91,6 @@ class RoIHeadTemplate(nn.Module):
         batch_dict['roi_scores'] = roi_scores
         batch_dict['roi_labels'] = roi_labels + 1
         batch_dict['has_class_labels'] = True if batch_cls_preds.shape[-1] > 1 else False
-        batch_dict.pop('batch_index', None)
         return batch_dict
 
     def assign_targets(self, batch_dict):
@@ -256,3 +251,4 @@ class RoIHeadTemplate(nn.Module):
         batch_box_preds[:, 0:3] += roi_xyz
         batch_box_preds = batch_box_preds.view(batch_size, -1, code_size)
         return batch_cls_preds, batch_box_preds
+
