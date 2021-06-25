@@ -16,13 +16,13 @@ import argparse
 import datetime
 import glob
 
-os.environ['CUDA_VISIBLE_DEVICES'] = "6"
+os.environ['CUDA_VISIBLE_DEVICES'] = "4,5"
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config for training')
 
-    parser.add_argument('--batch_size', type=int, default=4, required=False, help='batch size for training')
-    parser.add_argument('--epochs', type=int, default=1200, required=False, help='number of epochs to train for')
+    parser.add_argument('--batch_size', type=int, default=4*2, required=False, help='batch size for training')
+    parser.add_argument('--epochs', type=int, default=600, required=False, help='number of epochs to train for')
     parser.add_argument('--workers', type=int, default=4, help='number of workers for dataloader')
     parser.add_argument('--extra_tag', type=str, default='default', help='extra tag for this experiment')
     parser.add_argument('--ckpt', type=str, default=None, help='checkpoint to start from')
