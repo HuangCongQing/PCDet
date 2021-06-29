@@ -34,7 +34,7 @@ MODEL:
     CLASS_NAMES: ['Car','Pedestrian','Cyclist']
 
     VFE:
-        NAME: MeanVFE
+        NAME: MeanVFETrPD
 
     BACKBONE_3D:
         NAME: VoxelBackBone8x
